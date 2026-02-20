@@ -29,6 +29,8 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from logger import AgentLogger
+
 load_dotenv(override=True)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -40,6 +42,12 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
+
+# 初始化日志器
+logger = AgentLogger(verbose=True, show_raw=True)
+
+# 子代理计数器
+_subagent_counter = 0
 
 
 # -- Tool implementations shared by parent and child --
@@ -112,25 +120,73 @@ CHILD_TOOLS = [
 
 
 # -- Subagent: fresh context, filtered tools, summary-only return --
-def run_subagent(prompt: str) -> str:
+def run_subagent(prompt: str, description: str = "subtask") -> str:
+    """
+    启动子代理执行任务
+
+    子代理特点:
+    - fresh context: 独立的消息历史
+    - filtered tools: 只有基础工具，不能递归启动子代理
+    - summary-only return: 只返回最终摘要给父代理
+    """
+    global _subagent_counter
+    _subagent_counter += 1
+    subagent_id = _subagent_counter
+
+    # 子代理日志标题
+    print(logger._color(f"\n{'╔' + '═' * 78 + '╗'}", "magenta"))
+    print(logger._color(f"║  🤖 SUBAGENT #{subagent_id} SPAWNED{' ' * 58}║", "magenta"))
+    print(logger._color(f"║  Description: {description[:60]}{' ' * (61 - min(len(description), 61))}║", "magenta"))
+    print(logger._color(f"╚{'═' * 78 + '╝'}", "magenta"))
+
     sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    iteration = 0
+
     for _ in range(30):  # safety limit
+        iteration += 1
+        # 子代理循环日志 (缩进显示)
+        indent = "  "
+        print(logger._color(f"\n{indent}🔄 SUBAGENT #{subagent_id} ITERATION #{iteration}", "magenta"))
+
         response = client.messages.create(
             model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
         )
+
         sub_messages.append({"role": "assistant", "content": response.content})
+
         if response.stop_reason != "tool_use":
+            print(logger._color(f"{indent}🏁 SUBAGENT #{subagent_id} DONE: {response.stop_reason}", "magenta"))
             break
+
+        # 执行工具调用
+        print(logger._color(f"{indent}🔧 Executing tools...", "magenta"))
         results = []
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+                # 简化的工具调用日志
+                output_preview = str(output)[:100] + "..." if len(str(output)) > 100 else str(output)
+                print(logger._color(f"{indent}  ⚡ {block.name}: {output_preview}", "dim"))
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+
         sub_messages.append({"role": "user", "content": results})
-    # Only the final text returns to the parent -- child context is discarded
-    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+
+    # 提取最终摘要
+    summary = "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+
+    # 子代理完成日志
+    print(logger._color(f"\n{'╔' + '═' * 78 + '╗'}", "green"))
+    print(logger._color(f"║  ✅ SUBAGENT #{subagent_id} COMPLETED{' ' * 54}║", "green"))
+    summary_preview = summary[:200] + "..." if len(summary) > 200 else summary
+    print(logger._color(f"║  Summary: {summary_preview[:66]}{' ' * (67 - min(len(summary_preview), 67))}║", "green"))
+    print(logger._color(f"╚{'═' * 78 + '╝'}", "green"))
+
+    return summary
 
 
 # -- Parent tools: base tools + task dispatcher --
@@ -141,30 +197,74 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 
 def agent_loop(messages: list):
+    """父代理循环"""
+    iteration = 0
+
     while True:
+        iteration += 1
+        logger.loop_iteration(iteration)
+        logger.messages_snapshot(messages, "BEFORE LLM CALL")
+
+        # 显示原始请求
+        logger.request_raw(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=PARENT_TOOLS,
+            max_tokens=8000
+        )
+
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=PARENT_TOOLS, max_tokens=8000,
         )
+
+        # 显示原始响应
+        logger.response_raw(response)
+
+        # 显示响应摘要
+        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        logger.llm_response_summary(response.stop_reason, usage, len(response.content))
+        logger.response_content_blocks(response.content)
+
         messages.append({"role": "assistant", "content": response.content})
+        logger.messages_snapshot(messages, "AFTER APPEND ASSISTANT")
+
         if response.stop_reason != "tool_use":
+            logger.loop_end(f"stop_reason = '{response.stop_reason}'")
             return
+
+        # 执行工具调用
+        logger.section("Executing Tool Calls", "🔧")
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                input_data = dict(block.input)
+                logger.tool_call(block.name, input_data, block.id)
+
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
-                    print(f"> task ({desc}): {block.input['prompt'][:80]}")
-                    output = run_subagent(block.input["prompt"])
+                    prompt = block.input["prompt"]
+                    output = run_subagent(prompt, desc)
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
+                    try:
+                        output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    except Exception as e:
+                        output = f"Error: {e}"
+
+                is_error = str(output).startswith("Error:")
+                logger.tool_result(block.id, str(output), is_error=is_error)
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
         messages.append({"role": "user", "content": results})
+        logger.messages_snapshot(messages, "AFTER APPEND TOOL RESULTS")
+        logger.separator(f"END OF ITERATION {iteration}")
 
 
 if __name__ == "__main__":
+    logger.header("s04 Subagent - Interactive Mode", "s04")
+
     history = []
     while True:
         try:
@@ -173,6 +273,13 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        logger.user_input(query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        logger.separator("FINAL RESPONSE")
+        for block in history[-1]["content"] if isinstance(history[-1]["content"], list) else []:
+            if hasattr(block, "text"):
+                print(block.text)
         print()

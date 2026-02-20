@@ -33,6 +33,8 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from logger import AgentLogger
+
 load_dotenv(override=True)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -45,6 +47,9 @@ MODEL = os.environ["MODEL_ID"]
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose."""
+
+# 初始化日志器
+logger = AgentLogger(verbose=True, show_raw=True)
 
 
 # -- TodoManager: structured state the LLM writes to --
@@ -162,37 +167,89 @@ TOOLS = [
 # -- Agent loop with nag reminder injection --
 def agent_loop(messages: list):
     rounds_since_todo = 0
+    iteration = 0
+
     while True:
+        iteration += 1
+        logger.loop_iteration(iteration)
+        logger.messages_snapshot(messages, "BEFORE LLM CALL")
+
         # Nag reminder: if 3+ rounds without a todo update, inject reminder
         if rounds_since_todo >= 3 and messages:
             last = messages[-1]
             if last["role"] == "user" and isinstance(last.get("content"), list):
-                last["content"].insert(0, {"type": "text", "text": "<reminder>Update your todos.</reminder>"})
+                reminder = {"type": "text", "text": "<reminder>Update your todos.</reminder>"}
+                last["content"].insert(0, reminder)
+                logger.section("Nag Reminder Injected", "⚠️")
+
+        # 显示原始 API 请求数据
+        logger.request_raw(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=8000
+        )
+
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+
+        # 显示原始 API 响应数据
+        logger.response_raw(response)
+
+        # 显示 LLM 响应摘要
+        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        logger.llm_response_summary(response.stop_reason, usage, len(response.content))
+
+        # 显示响应内容详情
+        logger.response_content_blocks(response.content)
+
         messages.append({"role": "assistant", "content": response.content})
+        logger.messages_snapshot(messages, "AFTER APPEND ASSISTANT")
+
         if response.stop_reason != "tool_use":
+            logger.loop_end(f"stop_reason = '{response.stop_reason}'")
             return
+
+        # Execute tools
+        logger.section("Executing Tool Calls", "🔧")
         results = []
         used_todo = False
         for block in response.content:
             if block.type == "tool_use":
+                # 显示工具调用
+                input_data = dict(block.input) if block.name == "todo" else dict(block.input)
+                logger.tool_call(block.name, input_data, block.id)
+
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
+                # 显示工具结果
+                is_error = str(output).startswith("Error:")
+                logger.tool_result(block.id, str(output), is_error=is_error)
+
+                # 特殊处理 todo 工具：显示更新后的状态
                 if block.name == "todo":
                     used_todo = True
+                    logger.section("Todo State Updated", "📋")
+                    print(TODO.render())
+
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         messages.append({"role": "user", "content": results})
+        logger.messages_snapshot(messages, "AFTER APPEND TOOL RESULTS")
+        logger.separator(f"END OF ITERATION {iteration}")
 
 
 if __name__ == "__main__":
+    logger.header("s03 TodoWrite Agent - Interactive Mode", "s03")
+
     history = []
     while True:
         try:
@@ -201,6 +258,13 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        logger.user_input(query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        logger.separator("FINAL RESPONSE")
+        for block in history[-1]["content"] if isinstance(history[-1]["content"], list) else []:
+            if hasattr(block, "text"):
+                print(block.text)
         print()

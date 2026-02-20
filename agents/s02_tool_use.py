@@ -25,6 +25,8 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from logger import AgentLogger
+
 load_dotenv(override=True)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -32,9 +34,12 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+MODEL = os.getenv("MODEL_ID", "claude-sonnet-4-5-20250929")
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+
+# 初始化日志器
+logger = AgentLogger(verbose=True, show_raw=True)
 
 
 def safe_path(p: str) -> Path:
@@ -111,25 +116,83 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    iteration = 0
+
     while True:
+        iteration += 1
+        logger.loop_iteration(iteration)
+
+        # 显示调用 LLM 前的消息状态
+        logger.messages_snapshot(messages, "BEFORE LLM CALL")
+
+        # ========== 显示原始 API 请求数据 ==========
+        logger.request_raw(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=8000
+        )
+
+        # 调用 LLM
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+
+        # ========== 显示原始 API 响应数据 ==========
+        logger.response_raw(response)
+
+        # 显示 LLM 响应摘要
+        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        logger.llm_response_summary(response.stop_reason, usage, len(response.content))
+
+        # 显示响应内容详情
+        logger.response_content_blocks(response.content)
+
+        # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
+        logger.messages_snapshot(messages, "AFTER APPEND ASSISTANT")
+
+        # If the model didn't call a tool, we're done
         if response.stop_reason != "tool_use":
+            logger.loop_end("stop_reason != 'tool_use'")
             return
+
+        # Execute each tool call, collect results
+        logger.section("Executing Tool Calls", "🔧")
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # 显示工具调用
+                input_data = dict(block.input)
+                logger.tool_call(block.name, input_data, block.id)
+
+                # 执行工具
                 handler = TOOL_HANDLERS.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"> {block.name}: {output[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+                print(f"\033[33m> {block.name}:\033[0m {output[:200]}")
+
+                # 显示工具结果
+                is_error = output.startswith("Error:")
+                logger.tool_result(block.id, output, is_error=is_error)
+
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": output,
+                })
+
+        # 追加工具结果
         messages.append({"role": "user", "content": results})
+        logger.messages_snapshot(messages, "AFTER APPEND TOOL RESULTS")
+
+        logger.separator(f"END OF ITERATION {iteration}")
 
 
 if __name__ == "__main__":
+    logger.header("s02 Multi-Tool - Interactive Mode", "s02")
+
     history = []
     while True:
         try:
@@ -138,6 +201,14 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        logger.user_input(query)
+
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        logger.separator("FINAL RESPONSE")
+        for block in history[-1]["content"] if isinstance(history[-1]["content"], list) else []:
+            if hasattr(block, "text"):
+                print(block.text)
         print()

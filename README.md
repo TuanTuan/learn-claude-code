@@ -133,6 +133,137 @@ npm run dev
 # Open http://localhost:3000
 ```
 
+## Structured Logging System
+
+All agents include a unified logging system (`agents/logger.py`) for debugging and analysis.
+
+### Command Line Arguments
+
+```bash
+# Default: verbose terminal output + show raw API data
+python agents/s01_agent_loop.py
+
+# Quiet mode: suppress terminal output
+python agents/s01_agent_loop.py -q
+
+# Hide raw API request/response data
+python agents/s01_agent_loop.py --no-show-raw
+
+# Output to Markdown file
+python agents/s01_agent_loop.py -o logs/session.md
+
+# Quiet + file output (for background runs)
+python agents/s01_agent_loop.py -q -o logs/session.md
+
+# File without raw data (smaller files)
+python agents/s01_agent_loop.py -o logs/session.md --no-file-show-raw
+
+# Append to existing log file
+python agents/s01_agent_loop.py -o logs/session.md -a
+
+# Combined: quiet mode + file with collapsible raw data
+python agents/s01_agent_loop.py -q -o logs/session.md --file-show-raw
+```
+
+### Logging Arguments Reference
+
+| Argument | Short | Description |
+|----------|-------|-------------|
+| `--verbose` / `--no-verbose` | - | Terminal verbose output (default: True) |
+| `-q`, `--quiet` | -q | Quiet mode (equivalent to `--no-verbose`) |
+| `--show-raw` / `--no-show-raw` | - | Show raw API data in terminal (default: True) |
+| `-o`, `--log-file` | -o | Markdown log file path |
+| `--file-show-raw` / `--no-file-show-raw` | - | Include raw API data in file (default: True) |
+| `-a`, `--append` | -a | Append to existing log file (default: overwrite) |
+
+### Markdown Log Features
+
+When using `-o` to output to a file, the log includes:
+
+- **Collapsible sections** (`<details>`) for full API request/response JSON
+- **Structured headings** with iteration counts
+- **Code blocks** with syntax highlighting
+- **Timestamps** for session start/end and duration
+- **Tool call traces** with inputs and outputs
+
+Example Markdown output:
+
+```markdown
+# Agent Session Log
+
+**Started:** 2024-01-15 10:30:00
+
+---
+
+## 🔄 Loop Iteration #1
+
+#### 📤 API Request
+
+**Request Summary:**
+```json
+{"model": "claude-3-5-sonnet", "messages": [...]}
+```
+
+<details>
+<summary>📄 Full Request JSON (click to expand)</summary>
+
+```json
+{
+  "model": "claude-3-5-sonnet",
+  "system": "...",
+  "messages": [...],
+  "tools": [...]
+}
+```
+
+</details>
+
+#### ⚡ Tool Call: `bash`
+
+- **Input:**
+```json
+{"command": "ls -la"}
+```
+
+#### ✓ Success Tool Result
+
+<details>
+<summary>Full Content (click to expand)</summary>
+
+```
+total 48
+drwxr-xr-x  12 user  staff   384 Jan 15 10:30 .
+...
+```
+
+</details>
+```
+
+### Programmatic Usage
+
+```python
+from logger import AgentLogger, create_logger_from_args, get_logger_config_string
+
+# Method 1: Direct initialization
+logger = AgentLogger(
+    verbose=True,
+    show_raw=True,
+    log_file="logs/session.md",
+    file_show_raw=True
+)
+
+# Method 2: From command-line arguments
+from logger import parse_logger_args
+args = parse_logger_args()
+logger = create_logger_from_args(args)
+
+# Display current config
+print(f"Config: {get_logger_config_string(args)}")
+
+# End session with summary
+logger.session_end("Task completed successfully")
+```
+
 ## Session Comparison
 
 ```

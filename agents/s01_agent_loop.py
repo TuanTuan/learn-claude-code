@@ -20,15 +20,24 @@ The entire secret of coding agents in one pattern:
 
 That's it. The ENTIRE agent is a while loop that feeds tool
 results back to the model until the model decides to stop.
+
+命令行参数:
+    python s01_agent_loop.py                    # 默认：终端详细日志 + 显示RAW
+    python s01_agent_loop.py -q                 # 安静模式：不在终端显示日志
+    python s01_agent_loop.py --no-show-raw      # 不显示原始API数据
+    python s01_agent_loop.py -o session.md      # 输出到Markdown文件
+    python s01_agent_loop.py -q -o logs/s01.md  # 只写文件，不在终端显示
+    python s01_agent_loop.py --log-file session.md --no-file-show-raw  # 文件中不含RAW
 """
 
 import os
 import subprocess
+import sys
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from logger import AgentLogger
+from logger import create_logger_from_args, parse_logger_args, get_logger_config_string
 
 load_dotenv(override=True)
 
@@ -50,8 +59,9 @@ TOOLS = [{
     },
 }]
 
-# 初始化日志器
-logger = AgentLogger(verbose=True, show_raw=True)
+# 解析命令行参数并初始化日志器
+_args = parse_logger_args()
+logger = create_logger_from_args(_args)
 
 
 def run_bash(command: str) -> str:
@@ -148,6 +158,12 @@ def agent_loop(messages: list):
 if __name__ == "__main__":
     logger.header("s01 Agent Loop - Interactive Mode", "s01")
 
+    # 显示当前日志配置
+    print(logger._color(f"\n  ⚙️ Logger Config: {get_logger_config_string(_args)}", "dim"))
+    if _args.log_file:
+        print(logger._color(f"  📁 Log file: {_args.log_file}", "dim"))
+    print()
+
     history = []
     while True:
         try:
@@ -167,3 +183,6 @@ if __name__ == "__main__":
             if hasattr(block, "text"):
                 print(block.text)
         print()
+
+    # 结束会话
+    logger.session_end("用户退出")

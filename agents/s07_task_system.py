@@ -29,6 +29,8 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from logger import AgentLogger
+
 load_dotenv(override=True)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -40,6 +42,9 @@ MODEL = os.environ["MODEL_ID"]
 TASKS_DIR = WORKDIR / ".tasks"
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track work."
+
+# 初始化日志器
+logger = AgentLogger(verbose=True, show_raw=True)
 
 
 # -- TaskManager: CRUD with dependency graph, persisted as JSON files --
@@ -70,23 +75,35 @@ class TaskManager:
         }
         self._save(task)
         self._next_id += 1
+
+        # 日志：显示任务创建
+        self._print_task_created(task)
+
         return json.dumps(task, indent=2)
 
     def get(self, task_id: int) -> str:
-        return json.dumps(self._load(task_id), indent=2)
+        task = self._load(task_id)
+        self._print_task_detail(task)
+        return json.dumps(task, indent=2)
 
     def update(self, task_id: int, status: str = None,
                add_blocked_by: list = None, add_blocks: list = None) -> str:
         task = self._load(task_id)
+        old_status = task.get("status", "pending")
+
         if status:
             if status not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"Invalid status: {status}")
             task["status"] = status
             # When a task is completed, remove it from all other tasks' blockedBy
             if status == "completed":
-                self._clear_dependency(task_id)
+                unblocked = self._clear_dependency(task_id)
+                if unblocked:
+                    self._print_dependency_cleared(task_id, unblocked)
+
         if add_blocked_by:
             task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+
         if add_blocks:
             task["blocks"] = list(set(task["blocks"] + add_blocks))
             # Bidirectional: also update the blocked tasks' blockedBy lists
@@ -98,21 +115,34 @@ class TaskManager:
                         self._save(blocked)
                 except ValueError:
                     pass
+
         self._save(task)
+
+        # 日志：显示任务更新
+        self._print_task_updated(task, old_status, add_blocked_by, add_blocks)
+
         return json.dumps(task, indent=2)
 
-    def _clear_dependency(self, completed_id: int):
-        """Remove completed_id from all other tasks' blockedBy lists."""
+    def _clear_dependency(self, completed_id: int) -> list:
+        """Remove completed_id from all other tasks' blockedBy lists. Returns unblocked task IDs."""
+        unblocked = []
         for f in self.dir.glob("task_*.json"):
             task = json.loads(f.read_text())
             if completed_id in task.get("blockedBy", []):
                 task["blockedBy"].remove(completed_id)
                 self._save(task)
+                # 如果这个任务不再被阻塞，记录下来
+                if not task["blockedBy"] and task["status"] == "pending":
+                    unblocked.append(task["id"])
+        return unblocked
 
     def list_all(self) -> str:
         tasks = []
         for f in sorted(self.dir.glob("task_*.json")):
             tasks.append(json.loads(f.read_text()))
+
+        self._print_task_list(tasks)
+
         if not tasks:
             return "No tasks."
         lines = []
@@ -121,6 +151,94 @@ class TaskManager:
             blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
             lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
         return "\n".join(lines)
+
+    # -- 日志输出方法 --
+    def _print_task_created(self, task: dict):
+        """打印任务创建日志"""
+        print(logger._color(f"\n{'┌' + '─' * 78 + '┐'}", "green"))
+        print(logger._color(f"│  ✅ TASK CREATED: #{task['id']}" + " " * (62 - len(str(task['id']))) + "│", "green"))
+        print(logger._color(f"│  Subject: {task['subject'][:65]}" + " " * (68 - min(len(task['subject']), 65)) + "│", "green"))
+        if task.get("description"):
+            desc = task["description"][:60]
+            print(logger._color(f"│  Description: {desc}" + " " * (63 - len(desc)) + "│", "dim"))
+        print(logger._color(f"│  Status: pending" + " " * 61 + "│", "dim"))
+        print(logger._color(f"└" + "─" * 78 + "┘", "green"))
+
+    def _print_task_updated(self, task: dict, old_status: str, add_blocked_by: list, add_blocks: list):
+        """打印任务更新日志"""
+        status_icons = {"pending": "⏳", "in_progress": "🔄", "completed": "✅"}
+        icon = status_icons.get(task["status"], "❓")
+
+        print(logger._color(f"\n{'┌' + '─' * 78 + '┐'}", "yellow"))
+        print(logger._color(f"│  {icon} TASK UPDATED: #{task['id']}" + " " * (61 - len(str(task['id']))) + "│", "yellow"))
+        print(logger._color(f"│  Subject: {task['subject'][:65]}" + " " * (68 - min(len(task['subject']), 65)) + "│", "yellow"))
+
+        if old_status != task["status"]:
+            print(logger._color(f"│  Status: {old_status} → {task['status']}" + " " * (60 - len(old_status) - len(task['status'])) + "│", "cyan"))
+
+        if add_blocked_by:
+            print(logger._color(f"│  Blocked by: {add_blocked_by}" + " " * (64 - len(str(add_blocked_by))) + "│", "red"))
+
+        if add_blocks:
+            print(logger._color(f"│  Blocks: {add_blocks}" + " " * (68 - len(str(add_blocks))) + "│", "magenta"))
+
+        print(logger._color(f"└" + "─" * 78 + "┘", "yellow"))
+
+    def _print_task_detail(self, task: dict):
+        """打印任务详情"""
+        status_icons = {"pending": "⏳", "in_progress": "🔄", "completed": "✅"}
+        icon = status_icons.get(task["status"], "❓")
+
+        print(logger._color(f"\n  📋 TASK #{task['id']} DETAILS:", "cyan"))
+        print(logger._color(f"      Subject: {task['subject']}", "dim"))
+        print(logger._color(f"      Status: {icon} {task['status']}", "dim"))
+        if task.get("description"):
+            print(logger._color(f"      Description: {task['description'][:100]}", "dim"))
+        if task.get("blockedBy"):
+            print(logger._color(f"      Blocked by: {task['blockedBy']}", "red"))
+        if task.get("blocks"):
+            print(logger._color(f"      Blocks: {task['blocks']}", "magenta"))
+
+    def _print_task_list(self, tasks: list):
+        """打印任务列表"""
+        if not tasks:
+            print(logger._color(f"\n  📋 No tasks found.", "dim"))
+            return
+
+        # 统计
+        pending = sum(1 for t in tasks if t["status"] == "pending")
+        in_progress = sum(1 for t in tasks if t["status"] == "in_progress")
+        completed = sum(1 for t in tasks if t["status"] == "completed")
+
+        print(logger._color(f"\n{'╔' + '═' * 78 + '╗'}", "cyan"))
+        print(logger._color(f"║  📋 TASK LIST" + " " * 64 + "║", "cyan"))
+        print(logger._color(f"║  Total: {len(tasks)} | ⏳ Pending: {pending} | 🔄 In Progress: {in_progress} | ✅ Completed: {completed}" + " " * (78 - 73 - len(str([len(tasks), pending, in_progress, completed]))) + "║", "dim"))
+        print(logger._color(f"╠" + "═" * 78 + "╣", "cyan"))
+
+        for t in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
+            marker_color = {"pending": "white", "in_progress": "yellow", "completed": "green"}.get(t["status"], "white")
+            blocked = f" 🔒{t['blockedBy']}" if t.get("blockedBy") else ""
+            line = f"  {marker} #{t['id']}: {t['subject']}{blocked}"
+            print(logger._color(f"║{line}" + " " * (78 - len(line) - 1) + "║", marker_color))
+
+        print(logger._color(f"╚" + "═" * 78 + "╝", "cyan"))
+
+    def _print_dependency_cleared(self, completed_id: int, unblocked: list):
+        """打印依赖解除日志"""
+        print(logger._color(f"\n  🔓 DEPENDENCY CLEARED:", "green"))
+        print(logger._color(f"      Task #{completed_id} completed, unblocked tasks: {unblocked}", "dim"))
+
+    def print_summary(self):
+        """打印任务系统状态摘要"""
+        tasks = []
+        for f in sorted(self.dir.glob("task_*.json")):
+            tasks.append(json.loads(f.read_text()))
+
+        print(logger._color(f"\n  📊 Task System Summary:", "cyan"))
+        print(logger._color(f"      Tasks directory: {self.dir}", "dim"))
+        print(logger._color(f"      Total tasks: {len(tasks)}", "dim"))
+        print(logger._color(f"      Next task ID: {self._next_id}", "dim"))
 
 
 TASKS = TaskManager(TASKS_DIR)
@@ -207,28 +325,72 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """Agent 循环"""
+    iteration = 0
+
     while True:
+        iteration += 1
+        logger.loop_iteration(iteration)
+        logger.messages_snapshot(messages, "BEFORE LLM CALL")
+
+        # 显示原始请求
+        logger.request_raw(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=8000
+        )
+
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+
+        # 显示原始响应
+        logger.response_raw(response)
+
+        # 显示响应摘要
+        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        logger.llm_response_summary(response.stop_reason, usage, len(response.content))
+        logger.response_content_blocks(response.content)
+
         messages.append({"role": "assistant", "content": response.content})
+        logger.messages_snapshot(messages, "AFTER APPEND ASSISTANT")
+
         if response.stop_reason != "tool_use":
+            logger.loop_end(f"stop_reason = '{response.stop_reason}'")
             return
+
+        # 执行工具调用
+        logger.section("Executing Tool Calls", "🔧")
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                input_data = dict(block.input)
+                logger.tool_call(block.name, input_data, block.id)
+
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+
+                is_error = str(output).startswith("Error:")
+                logger.tool_result(block.id, str(output), is_error=is_error)
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
         messages.append({"role": "user", "content": results})
+        logger.messages_snapshot(messages, "AFTER APPEND TOOL RESULTS")
+        logger.separator(f"END OF ITERATION {iteration}")
 
 
 if __name__ == "__main__":
+    logger.header("s07 Task System - Interactive Mode", "s07")
+
+    # 显示任务系统状态
+    TASKS.print_summary()
+
     history = []
     while True:
         try:
@@ -237,6 +399,13 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        logger.user_input(query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        logger.separator("FINAL RESPONSE")
+        for block in history[-1]["content"] if isinstance(history[-1]["content"], list) else []:
+            if hasattr(block, "text"):
+                print(block.text)
         print()

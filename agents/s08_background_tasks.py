@@ -33,6 +33,8 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from logger import AgentLogger
+
 load_dotenv(override=True)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -43,6 +45,9 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
+
+# 初始化日志器
+logger = AgentLogger(verbose=True, show_raw=True)
 
 
 # -- BackgroundManager: threaded execution + notification queue --
@@ -60,6 +65,10 @@ class BackgroundManager:
             target=self._execute, args=(task_id, command), daemon=True
         )
         thread.start()
+
+        # 日志：后台任务启动
+        self._print_task_started(task_id, command)
+
         return f"Background task {task_id} started: {command[:80]}"
 
     def _execute(self, task_id: str, command: str):
@@ -87,13 +96,20 @@ class BackgroundManager:
                 "result": (output or "(no output)")[:500],
             })
 
+        # 日志：后台任务完成（在线程中打印，使用特殊标记）
+        self._print_task_completed(task_id, status, output)
+
     def check(self, task_id: str = None) -> str:
         """Check status of one task or list all."""
         if task_id:
             t = self.tasks.get(task_id)
             if not t:
                 return f"Error: Unknown task {task_id}"
+            self._print_task_detail(task_id, t)
             return f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
+
+        # 列出所有任务
+        self._print_task_list()
         lines = []
         for tid, t in self.tasks.items():
             lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
@@ -105,6 +121,95 @@ class BackgroundManager:
             notifs = list(self._notification_queue)
             self._notification_queue.clear()
         return notifs
+
+    # -- 日志输出方法 --
+    def _print_task_started(self, task_id: str, command: str):
+        """打印后台任务启动日志"""
+        print(logger._color(f"\n{'┌' + '─' * 78 + '┐'}", "magenta"))
+        print(logger._color(f"│  🚀 BACKGROUND TASK STARTED" + " " * 50 + "│", "magenta"))
+        print(logger._color(f"│  Task ID: {task_id}" + " " * (69 - len(task_id)) + "│", "magenta"))
+        cmd_preview = command[:65] + "..." if len(command) > 65 else command
+        print(logger._color(f"│  Command: {cmd_preview}" + " " * (69 - len(cmd_preview)) + "│", "dim"))
+        print(logger._color(f"│  Status: 🔄 Running..." + " " * 55 + "│", "yellow"))
+        print(logger._color(f"└" + "─" * 78 + "┘", "magenta"))
+
+    def _print_task_completed(self, task_id: str, status: str, output: str):
+        """打印后台任务完成日志（从线程中调用）"""
+        status_icons = {"completed": "✅", "timeout": "⏱️", "error": "❌"}
+        icon = status_icons.get(status, "❓")
+
+        print(logger._color(f"\n{'┌' + '─' * 78 + '┐'}", "green" if status == "completed" else "red"))
+        print(logger._color(f"│  {icon} BACKGROUND TASK COMPLETED" + " " * (48 if status == "completed" else 49) + "│",
+                           "green" if status == "completed" else "red"))
+        print(logger._color(f"│  Task ID: {task_id}" + " " * (69 - len(task_id)) + "│",
+                           "green" if status == "completed" else "red"))
+        print(logger._color(f"│  Status: {status}" + " " * (70 - len(status)) + "│", "dim"))
+        output_preview = (output[:100] + "...") if len(output) > 100 else output
+        output_line = output_preview.replace("\n", " ")[:68]
+        print(logger._color(f"│  Output: {output_line}" + " " * (69 - len(output_line)) + "│", "dim"))
+        print(logger._color(f"└" + "─" * 78 + "┘", "green" if status == "completed" else "red"))
+
+    def _print_task_detail(self, task_id: str, task: dict):
+        """打印单个任务详情"""
+        status_icons = {"running": "🔄", "completed": "✅", "timeout": "⏱️", "error": "❌"}
+        icon = status_icons.get(task["status"], "❓")
+
+        print(logger._color(f"\n  📋 BACKGROUND TASK #{task_id}:", "cyan"))
+        print(logger._color(f"      Status: {icon} {task['status']}", "dim"))
+        print(logger._color(f"      Command: {task['command'][:70]}", "dim"))
+        if task.get("result"):
+            result_preview = task["result"][:200]
+            print(logger._color(f"      Result: {result_preview[:70]}...", "dim"))
+
+    def _print_task_list(self):
+        """打印所有后台任务列表"""
+        if not self.tasks:
+            print(logger._color(f"\n  📋 No background tasks.", "dim"))
+            return
+
+        running = sum(1 for t in self.tasks.values() if t["status"] == "running")
+        completed = sum(1 for t in self.tasks.values() if t["status"] == "completed")
+        error = sum(1 for t in self.tasks.values() if t["status"] in ("error", "timeout"))
+
+        print(logger._color(f"\n{'╔' + '═' * 78 + '╗'}", "cyan"))
+        print(logger._color(f"║  📋 BACKGROUND TASKS" + " " * 57 + "║", "cyan"))
+        print(logger._color(f"║  Total: {len(self.tasks)} | 🔄 Running: {running} | ✅ Completed: {completed} | ❌ Error: {error}" + " " * (78 - 75 - len(str([len(self.tasks), running, completed, error]))) + "║", "dim"))
+        print(logger._color(f"╠" + "═" * 78 + "╣", "cyan"))
+
+        for tid, t in self.tasks.items():
+            status_icons = {"running": "🔄", "completed": "✅", "timeout": "⏱️", "error": "❌"}
+            icon = status_icons.get(t["status"], "❓")
+            line = f"  {icon} {tid}: {t['command'][:55]}"
+            print(logger._color(f"║{line}" + " " * (78 - len(line) - 1) + "║", "dim"))
+
+        print(logger._color(f"╚" + "═" * 78 + "╝", "cyan"))
+
+    def print_notifications(self, notifs: list):
+        """打印通知队列内容"""
+        if not notifs:
+            return
+
+        print(logger._color(f"\n{'╔' + '═' * 78 + '╗'}", "yellow"))
+        print(logger._color(f"║  📬 BACKGROUND NOTIFICATIONS ({len(notifs)} pending)" + " " * (31 - len(str(len(notifs)))) + "║", "yellow"))
+        print(logger._color(f"╠" + "═" * 78 + "╣", "yellow"))
+
+        for n in notifs:
+            status_icons = {"completed": "✅", "timeout": "⏱️", "error": "❌"}
+            icon = status_icons.get(n["status"], "❓")
+            print(logger._color(f"║  {icon} [{n['task_id']}] {n['status']}", "yellow"))
+            print(logger._color(f"║      Command: {n['command'][:65]}", "dim"))
+            result_line = n["result"][:65].replace("\n", " ")
+            print(logger._color(f"║      Result: {result_line}", "dim"))
+
+        print(logger._color(f"╚" + "═" * 78 + "╝", "yellow"))
+
+    def print_summary(self):
+        """打印后台任务系统状态摘要"""
+        running = sum(1 for t in self.tasks.values() if t["status"] == "running")
+        print(logger._color(f"\n  📊 Background Task System:", "cyan"))
+        print(logger._color(f"      Total tasks: {len(self.tasks)}", "dim"))
+        print(logger._color(f"      Currently running: {running}", "dim"))
+        print(logger._color(f"      Pending notifications: {len(self._notification_queue)}", "dim"))
 
 
 BG = BackgroundManager()
@@ -185,36 +290,84 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """Agent 循环"""
+    iteration = 0
+
     while True:
+        iteration += 1
+        logger.loop_iteration(iteration)
+
         # Drain background notifications and inject as system message before LLM call
         notifs = BG.drain_notifications()
         if notifs and messages:
+            BG.print_notifications(notifs)
             notif_text = "\n".join(
                 f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
             )
             messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
             messages.append({"role": "assistant", "content": "Noted background results."})
+            logger.messages_snapshot(messages, "AFTER INJECT NOTIFICATIONS")
+
+        logger.messages_snapshot(messages, "BEFORE LLM CALL")
+
+        # 显示原始请求
+        logger.request_raw(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=8000
+        )
+
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+
+        # 显示原始响应
+        logger.response_raw(response)
+
+        # 显示响应摘要
+        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        logger.llm_response_summary(response.stop_reason, usage, len(response.content))
+        logger.response_content_blocks(response.content)
+
         messages.append({"role": "assistant", "content": response.content})
+        logger.messages_snapshot(messages, "AFTER APPEND ASSISTANT")
+
         if response.stop_reason != "tool_use":
+            logger.loop_end(f"stop_reason = '{response.stop_reason}'")
             return
+
+        # 执行工具调用
+        logger.section("Executing Tool Calls", "🔧")
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                input_data = dict(block.input)
+                logger.tool_call(block.name, input_data, block.id)
+
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+
+                is_error = str(output).startswith("Error:")
+                logger.tool_result(block.id, str(output), is_error=is_error)
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
         messages.append({"role": "user", "content": results})
+        logger.messages_snapshot(messages, "AFTER APPEND TOOL RESULTS")
+        logger.separator(f"END OF ITERATION {iteration}")
 
 
 if __name__ == "__main__":
+    logger.header("s08 Background Tasks - Interactive Mode", "s08")
+
+    # 显示后台任务系统状态
+    BG.print_summary()
+
     history = []
     while True:
         try:
@@ -223,6 +376,13 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        logger.user_input(query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        logger.separator("FINAL RESPONSE")
+        for block in history[-1]["content"] if isinstance(history[-1]["content"], list) else []:
+            if hasattr(block, "text"):
+                print(block.text)
         print()

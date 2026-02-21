@@ -36,7 +36,7 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from logger import AgentLogger
+from logger import create_logger_from_args, parse_logger_args, get_logger_config_string
 
 load_dotenv(override=True)
 
@@ -48,8 +48,9 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / ".skills"
 
-# 初始化日志器
-logger = AgentLogger(verbose=True, show_raw=True)
+# 解析命令行参数并初始化日志器
+_args = parse_logger_args()
+logger = create_logger_from_args(_args)
 
 
 # -- SkillLoader: parse .skills/*.md files with YAML frontmatter --
@@ -286,6 +287,12 @@ def agent_loop(messages: list):
 if __name__ == "__main__":
     logger.header("s05 Skill Loading - Interactive Mode", "s05")
 
+    # 显示当前日志配置
+    print(logger._color(f"\n  ⚙️ Logger Config: {get_logger_config_string(_args)}", "dim"))
+    if _args.log_file:
+        print(logger._color(f"  📁 Log file: {_args.log_file}", "dim"))
+    print()
+
     # 显示已加载的技能
     logger.section("Available Skills", "📚")
     SKILL_LOADER.print_loaded_skills()
@@ -308,3 +315,6 @@ if __name__ == "__main__":
             if hasattr(block, "text"):
                 print(block.text)
         print()
+
+    # 结束会话
+    logger.session_end("用户退出")

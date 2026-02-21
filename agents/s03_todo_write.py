@@ -33,7 +33,7 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from logger import AgentLogger
+from logger import create_logger_from_args, parse_logger_args, get_logger_config_string
 
 load_dotenv(override=True)
 
@@ -48,8 +48,9 @@ SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose."""
 
-# 初始化日志器
-logger = AgentLogger(verbose=True, show_raw=True)
+# 解析命令行参数并初始化日志器
+_args = parse_logger_args()
+logger = create_logger_from_args(_args)
 
 
 # -- TodoManager: structured state the LLM writes to --
@@ -250,6 +251,12 @@ def agent_loop(messages: list):
 if __name__ == "__main__":
     logger.header("s03 TodoWrite Agent - Interactive Mode", "s03")
 
+    # 显示当前日志配置
+    print(logger._color(f"\n  ⚙️ Logger Config: {get_logger_config_string(_args)}", "dim"))
+    if _args.log_file:
+        print(logger._color(f"  📁 Log file: {_args.log_file}", "dim"))
+    print()
+
     history = []
     while True:
         try:
@@ -268,3 +275,6 @@ if __name__ == "__main__":
             if hasattr(block, "text"):
                 print(block.text)
         print()
+
+    # 结束会话
+    logger.session_end("用户退出")

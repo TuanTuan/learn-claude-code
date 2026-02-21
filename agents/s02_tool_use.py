@@ -25,7 +25,7 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from logger import AgentLogger
+from logger import create_logger_from_args, parse_logger_args, get_logger_config_string
 
 load_dotenv(override=True)
 
@@ -38,8 +38,9 @@ MODEL = os.getenv("MODEL_ID", "claude-sonnet-4-5-20250929")
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
-# 初始化日志器
-logger = AgentLogger(verbose=True, show_raw=True)
+# 解析命令行参数并初始化日志器
+_args = parse_logger_args()
+logger = create_logger_from_args(_args)
 
 
 def safe_path(p: str) -> Path:
@@ -193,6 +194,12 @@ def agent_loop(messages: list):
 if __name__ == "__main__":
     logger.header("s02 Multi-Tool - Interactive Mode", "s02")
 
+    # 显示当前日志配置
+    print(logger._color(f"\n  ⚙️ Logger Config: {get_logger_config_string(_args)}", "dim"))
+    if _args.log_file:
+        print(logger._color(f"  📁 Log file: {_args.log_file}", "dim"))
+    print()
+
     history = []
     while True:
         try:
@@ -212,3 +219,6 @@ if __name__ == "__main__":
             if hasattr(block, "text"):
                 print(block.text)
         print()
+
+    # 结束会话
+    logger.session_end("用户退出")

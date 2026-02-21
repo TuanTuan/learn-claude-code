@@ -33,7 +33,7 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from logger import AgentLogger
+from logger import create_logger_from_args, parse_logger_args, get_logger_config_string
 
 load_dotenv(override=True)
 
@@ -46,8 +46,9 @@ MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
-# 初始化日志器
-logger = AgentLogger(verbose=True, show_raw=True)
+# 解析命令行参数并初始化日志器
+_args = parse_logger_args()
+logger = create_logger_from_args(_args)
 
 
 # -- BackgroundManager: threaded execution + notification queue --
@@ -365,6 +366,12 @@ def agent_loop(messages: list):
 if __name__ == "__main__":
     logger.header("s08 Background Tasks - Interactive Mode", "s08")
 
+    # 显示当前日志配置
+    print(logger._color(f"\n  ⚙️ Logger Config: {get_logger_config_string(_args)}", "dim"))
+    if _args.log_file:
+        print(logger._color(f"  📁 Log file: {_args.log_file}", "dim"))
+    print()
+
     # 显示后台任务系统状态
     BG.print_summary()
 
@@ -386,3 +393,6 @@ if __name__ == "__main__":
             if hasattr(block, "text"):
                 print(block.text)
         print()
+
+    # 结束会话
+    logger.session_end("用户退出")

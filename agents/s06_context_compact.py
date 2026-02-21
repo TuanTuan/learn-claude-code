@@ -42,7 +42,7 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from logger import AgentLogger
+from logger import create_logger_from_args, parse_logger_args, get_logger_config_string
 
 load_dotenv(override=True)
 
@@ -59,8 +59,9 @@ THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 3
 
-# 初始化日志器
-logger = AgentLogger(verbose=True, show_raw=True)
+# 解析命令行参数并初始化日志器
+_args = parse_logger_args()
+logger = create_logger_from_args(_args)
 
 
 def estimate_tokens(messages: list) -> int:
@@ -349,8 +350,14 @@ def agent_loop(messages: list):
 if __name__ == "__main__":
     logger.header("s06 Context Compact - Interactive Mode", "s06")
 
+    # 显示当前日志配置
+    print(logger._color(f"\n  ⚙️ Logger Config: {get_logger_config_string(_args)}", "dim"))
+    if _args.log_file:
+        print(logger._color(f"  📁 Log file: {_args.log_file}", "dim"))
+    print()
+
     # 显示配置信息
-    print(logger._color(f"\n  ⚙️ Compact Configuration:", "cyan"))
+    print(logger._color(f"  ⚙️ Compact Configuration:", "cyan"))
     print(logger._color(f"      Token threshold: {THRESHOLD:,}", "dim"))
     print(logger._color(f"      Keep recent tool results: {KEEP_RECENT}", "dim"))
     print(logger._color(f"      Transcript directory: {TRANSCRIPT_DIR}", "dim"))
@@ -373,3 +380,6 @@ if __name__ == "__main__":
             if hasattr(block, "text"):
                 print(block.text)
         print()
+
+    # 结束会话
+    logger.session_end("用户退出")

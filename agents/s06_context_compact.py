@@ -42,6 +42,8 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from logger import AgentLogger
+
 load_dotenv(override=True)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -57,14 +59,45 @@ THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 KEEP_RECENT = 3
 
+# 初始化日志器
+logger = AgentLogger(verbose=True, show_raw=True)
+
 
 def estimate_tokens(messages: list) -> int:
     """Rough token count: ~4 chars per token."""
     return len(str(messages)) // 4
 
 
+def print_compact_header(layer: str, trigger: str = ""):
+    """打印压缩操作的标题"""
+    print(logger._color(f"\n{'╔' + '═' * 78 + '╗'}", "red"))
+    title = f"🗜️ {layer.upper()} COMPACT TRIGGERED"
+    if trigger:
+        title += f" ({trigger})"
+    print(logger._color(f"║  {title}" + " " * (77 - len(title)) + "║", "red"))
+    print(logger._color(f"╚{'═' * 78 + '╝'}", "red"))
+
+
+def print_compact_summary(before_tokens: int, after_tokens: int, transcript_path: str = ""):
+    """打印压缩结果摘要"""
+    saved = before_tokens - after_tokens
+    ratio = (saved / before_tokens * 100) if before_tokens > 0 else 0
+    print(logger._color(f"\n  📊 Compression Summary:", "cyan"))
+    print(logger._color(f"      Before: {before_tokens:,} tokens", "dim"))
+    print(logger._color(f"      After:  {after_tokens:,} tokens", "dim"))
+    print(logger._color(f"      Saved:  {saved:,} tokens ({ratio:.1f}%)", "green"))
+    if transcript_path:
+        print(logger._color(f"      Transcript: {transcript_path}", "dim"))
+
+
 # -- Layer 1: micro_compact - replace old tool results with placeholders --
-def micro_compact(messages: list) -> list:
+def micro_compact(messages: list) -> int:
+    """
+    Layer 1: 静默压缩旧工具结果
+
+    Returns:
+        int: 被压缩的结果数量
+    """
     # Collect (msg_index, part_index, tool_result_dict) for all tool_result entries
     tool_results = []
     for msg_idx, msg in enumerate(messages):
@@ -72,8 +105,10 @@ def micro_compact(messages: list) -> list:
             for part_idx, part in enumerate(msg["content"]):
                 if isinstance(part, dict) and part.get("type") == "tool_result":
                     tool_results.append((msg_idx, part_idx, part))
+
     if len(tool_results) <= KEEP_RECENT:
-        return messages
+        return 0
+
     # Find tool_name for each result by matching tool_use_id in prior assistant messages
     tool_name_map = {}
     for msg in messages:
@@ -83,25 +118,42 @@ def micro_compact(messages: list) -> list:
                 for block in content:
                     if hasattr(block, "type") and block.type == "tool_use":
                         tool_name_map[block.id] = block.name
+
     # Clear old results (keep last KEEP_RECENT)
     to_clear = tool_results[:-KEEP_RECENT]
+    cleared_count = 0
     for _, _, result in to_clear:
         if isinstance(result.get("content"), str) and len(result["content"]) > 100:
             tool_id = result.get("tool_use_id", "")
             tool_name = tool_name_map.get(tool_id, "unknown")
             result["content"] = f"[Previous: used {tool_name}]"
-    return messages
+            cleared_count += 1
+
+    return cleared_count
 
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
-def auto_compact(messages: list) -> list:
+def auto_compact(messages: list, verbose: bool = True) -> list:
+    """
+    Layer 2: 自动压缩 - 保存完整对话，生成摘要，替换消息
+    """
+    before_tokens = estimate_tokens(messages)
+
+    if verbose:
+        print_compact_header("AUTO", f"tokens > {THRESHOLD:,}")
+        print(logger._color(f"  💾 Saving transcript...", "yellow"))
+
     # Save full transcript to disk
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with open(transcript_path, "w") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
-    print(f"[transcript saved: {transcript_path}]")
+
+    if verbose:
+        print(logger._color(f"     Saved to: {transcript_path}", "dim"))
+        print(logger._color(f"  🤖 Generating summary...", "yellow"))
+
     # Ask LLM to summarize
     conversation_text = json.dumps(messages, default=str)[:80000]
     response = client.messages.create(
@@ -113,11 +165,27 @@ def auto_compact(messages: list) -> list:
         max_tokens=2000,
     )
     summary = response.content[0].text
+
     # Replace all messages with compressed summary
-    return [
+    new_messages = [
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
         {"role": "assistant", "content": "Understood. I have the context from the summary. Continuing."},
     ]
+
+    after_tokens = estimate_tokens(new_messages)
+
+    if verbose:
+        print_compact_summary(before_tokens, after_tokens, str(transcript_path))
+        # 显示摘要预览
+        print(logger._color(f"\n  📝 Summary Preview:", "cyan"))
+        summary_lines = summary.split("\n")[:5]
+        for line in summary_lines:
+            preview = line[:70] + "..." if len(line) > 70 else line
+            print(logger._color(f"      {preview}", "dim"))
+        if len(summary.split("\n")) > 5:
+            print(logger._color(f"      ... ({len(summary.split(chr(10))) - 5} more lines)", "dim"))
+
+    return new_messages
 
 
 # -- Tool implementations --
@@ -192,24 +260,67 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """Agent 循环，包含三层压缩机制"""
+    iteration = 0
+
     while True:
+        iteration += 1
+        logger.loop_iteration(iteration)
+
+        # 显示当前 token 估算
+        current_tokens = estimate_tokens(messages)
+        print(logger._color(f"  📊 Token estimate: {current_tokens:,} / {THRESHOLD:,}", "dim"))
+
         # Layer 1: micro_compact before each LLM call
-        micro_compact(messages)
+        cleared = micro_compact(messages)
+        if cleared > 0:
+            print(logger._color(f"  🗹 Layer 1 micro_compact: cleared {cleared} old tool results", "yellow"))
+
         # Layer 2: auto_compact if token estimate exceeds threshold
         if estimate_tokens(messages) > THRESHOLD:
-            print("[auto_compact triggered]")
-            messages[:] = auto_compact(messages)
+            print(logger._color(f"  ⚠️ Threshold exceeded ({current_tokens:,} > {THRESHOLD:,})", "red"))
+            messages[:] = auto_compact(messages, verbose=True)
+
+        logger.messages_snapshot(messages, "BEFORE LLM CALL")
+
+        # 显示原始请求
+        logger.request_raw(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=8000
+        )
+
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+
+        # 显示原始响应
+        logger.response_raw(response)
+
+        # 显示响应摘要
+        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        logger.llm_response_summary(response.stop_reason, usage, len(response.content))
+        logger.response_content_blocks(response.content)
+
         messages.append({"role": "assistant", "content": response.content})
+        logger.messages_snapshot(messages, "AFTER APPEND ASSISTANT")
+
         if response.stop_reason != "tool_use":
+            logger.loop_end(f"stop_reason = '{response.stop_reason}'")
             return
+
+        # 执行工具调用
+        logger.section("Executing Tool Calls", "🔧")
         results = []
         manual_compact = False
         for block in response.content:
             if block.type == "tool_use":
+                input_data = dict(block.input)
+                logger.tool_call(block.name, input_data, block.id)
+
                 if block.name == "compact":
                     manual_compact = True
                     output = "Compressing..."
@@ -219,16 +330,31 @@ def agent_loop(messages: list):
                         output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                     except Exception as e:
                         output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+
+                is_error = str(output).startswith("Error:")
+                logger.tool_result(block.id, str(output), is_error=is_error)
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
         messages.append({"role": "user", "content": results})
+        logger.messages_snapshot(messages, "AFTER APPEND TOOL RESULTS")
+
         # Layer 3: manual compact triggered by the compact tool
         if manual_compact:
-            print("[manual compact]")
-            messages[:] = auto_compact(messages)
+            print_compact_header("MANUAL", "compact tool called")
+            messages[:] = auto_compact(messages, verbose=True)
+
+        logger.separator(f"END OF ITERATION {iteration}")
 
 
 if __name__ == "__main__":
+    logger.header("s06 Context Compact - Interactive Mode", "s06")
+
+    # 显示配置信息
+    print(logger._color(f"\n  ⚙️ Compact Configuration:", "cyan"))
+    print(logger._color(f"      Token threshold: {THRESHOLD:,}", "dim"))
+    print(logger._color(f"      Keep recent tool results: {KEEP_RECENT}", "dim"))
+    print(logger._color(f"      Transcript directory: {TRANSCRIPT_DIR}", "dim"))
+
     history = []
     while True:
         try:
@@ -237,6 +363,13 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        logger.user_input(query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        logger.separator("FINAL RESPONSE")
+        for block in history[-1]["content"] if isinstance(history[-1]["content"], list) else []:
+            if hasattr(block, "text"):
+                print(block.text)
         print()

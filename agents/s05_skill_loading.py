@@ -36,6 +36,8 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from logger import AgentLogger
+
 load_dotenv(override=True)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -45,6 +47,9 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / ".skills"
+
+# 初始化日志器
+logger = AgentLogger(verbose=True, show_raw=True)
 
 
 # -- SkillLoader: parse .skills/*.md files with YAML frontmatter --
@@ -95,6 +100,40 @@ class SkillLoader:
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
         return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
+
+    def print_loaded_skills(self):
+        """打印已加载的技能列表（启动时显示）"""
+        if not self.skills:
+            print(logger._color("  (no skills found)", "dim"))
+            return
+
+        for name, skill in self.skills.items():
+            desc = skill["meta"].get("description", "No description")
+            tags = skill["meta"].get("tags", "")
+            path = skill["path"]
+            print(f"  {logger._color('📚', 'yellow')} {logger._color(name, 'cyan')}: {desc}")
+            if tags:
+                print(f"      Tags: {logger._color(tags, 'dim')}")
+            print(f"      Path: {logger._color(path, 'dim')}")
+
+    def print_skill_loaded(self, name: str, content: str):
+        """打印技能加载详情（调用 load_skill 时显示）"""
+        skill = self.skills.get(name)
+        if skill:
+            print(logger._color(f"\n{'┌' + '─' * 78 + '┐'}", "yellow"))
+            print(logger._color(f"│  📚 SKILL LOADED: {name}" + " " * (60 - len(name)) + "│", "yellow"))
+            desc = skill["meta"].get("description", "")
+            if desc:
+                print(logger._color(f"│  Description: {desc[:60]}" + " " * (67 - min(len(desc), 60)) + "│", "yellow"))
+            body_lines = skill["body"].split("\n")
+            preview = "\n".join(body_lines[:5])
+            if len(body_lines) > 5:
+                preview += f"\n... ({len(body_lines) - 5} more lines)"
+            print(logger._color(f"│" + " " * 78 + "│", "yellow"))
+            for line in preview.split("\n")[:7]:
+                truncated = line[:74] if len(line) > 74 else line
+                print(logger._color(f"│  {truncated}" + " " * (76 - len(truncated)) + "│", "dim"))
+            print(logger._color(f"└" + "─" * 78 + "┘", "yellow"))
 
 
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
@@ -179,28 +218,78 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """Agent 循环"""
+    iteration = 0
+
     while True:
+        iteration += 1
+        logger.loop_iteration(iteration)
+        logger.messages_snapshot(messages, "BEFORE LLM CALL")
+
+        # 显示原始请求
+        logger.request_raw(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=8000
+        )
+
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+
+        # 显示原始响应
+        logger.response_raw(response)
+
+        # 显示响应摘要
+        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        logger.llm_response_summary(response.stop_reason, usage, len(response.content))
+        logger.response_content_blocks(response.content)
+
         messages.append({"role": "assistant", "content": response.content})
+        logger.messages_snapshot(messages, "AFTER APPEND ASSISTANT")
+
         if response.stop_reason != "tool_use":
+            logger.loop_end(f"stop_reason = '{response.stop_reason}'")
             return
+
+        # 执行工具调用
+        logger.section("Executing Tool Calls", "🔧")
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                input_data = dict(block.input)
+                logger.tool_call(block.name, input_data, block.id)
+
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+
+                # 特殊处理 load_skill：显示加载的技能详情
+                if block.name == "load_skill":
+                    skill_name = block.input.get("name", "")
+                    SKILL_LOADER.print_skill_loaded(skill_name, output)
+
+                is_error = str(output).startswith("Error:")
+                logger.tool_result(block.id, str(output), is_error=is_error)
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
         messages.append({"role": "user", "content": results})
+        logger.messages_snapshot(messages, "AFTER APPEND TOOL RESULTS")
+        logger.separator(f"END OF ITERATION {iteration}")
 
 
 if __name__ == "__main__":
+    logger.header("s05 Skill Loading - Interactive Mode", "s05")
+
+    # 显示已加载的技能
+    logger.section("Available Skills", "📚")
+    SKILL_LOADER.print_loaded_skills()
+
     history = []
     while True:
         try:
@@ -209,6 +298,13 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        logger.user_input(query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        logger.separator("FINAL RESPONSE")
+        for block in history[-1]["content"] if isinstance(history[-1]["content"], list) else []:
+            if hasattr(block, "text"):
+                print(block.text)
         print()

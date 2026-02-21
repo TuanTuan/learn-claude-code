@@ -57,6 +57,8 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from logger import AgentLogger
+
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
@@ -68,6 +70,9 @@ TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 
 SYSTEM = f"You are a team lead at {WORKDIR}. Manage teammates with shutdown and plan approval protocols."
+
+# 初始化日志器
+logger = AgentLogger(verbose=True, show_raw=True)
 
 VALID_MSG_TYPES = {
     "message",
@@ -104,6 +109,10 @@ class MessageBus:
         inbox_path = self.dir / f"{to}.jsonl"
         with open(inbox_path, "a") as f:
             f.write(json.dumps(msg) + "\n")
+
+        # 日志：消息发送
+        self._print_message_sent(sender, to, msg_type, content, extra)
+
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
@@ -115,6 +124,11 @@ class MessageBus:
             if line:
                 messages.append(json.loads(line))
         inbox_path.write_text("")
+
+        # 日志：收件箱读取
+        if messages:
+            self._print_inbox_read(name, messages)
+
         return messages
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
@@ -123,7 +137,49 @@ class MessageBus:
             if name != sender:
                 self.send(sender, name, content, "broadcast")
                 count += 1
+
+        # 日志：广播
+        self._print_broadcast(sender, content, count)
+
         return f"Broadcast to {count} teammates"
+
+    # -- 日志输出方法 --
+    def _print_message_sent(self, sender: str, to: str, msg_type: str, content: str, extra: dict):
+        """打印消息发送日志"""
+        content_preview = content[:40] + "..." if len(content) > 40 else content
+        print(logger._color(f"  📨 MESSAGE SENT", "green"))
+        print(logger._color(f"      From: {sender} → To: {to}", "dim"))
+        print(logger._color(f"      Type: {msg_type}", "dim"))
+        if extra:
+            extra_keys = list(extra.keys())[:3]
+            print(logger._color(f"      Extra: {extra_keys}", "dim"))
+        print(logger._color(f"      Content: {content_preview}", "dim"))
+
+    def _print_inbox_read(self, name: str, messages: list):
+        """打印收件箱读取日志"""
+        print(logger._color(f"  📬 INBOX READ: {name}", "yellow"))
+        print(logger._color(f"      Messages: {len(messages)}", "dim"))
+        for i, msg in enumerate(messages[:3]):
+            msg_from = msg.get("from", "unknown")
+            msg_type = msg.get("type", "message")
+            content_preview = msg.get("content", "")[:30]
+            print(logger._color(f"      [{i+1}] {msg_type} from {msg_from}: {content_preview}", "dim"))
+        if len(messages) > 3:
+            print(logger._color(f"      ... ({len(messages) - 3} more)", "dim"))
+
+    def _print_broadcast(self, sender: str, content: str, count: int):
+        """打印广播日志"""
+        content_preview = content[:40] + "..." if len(content) > 40 else content
+        print(logger._color(f"  📢 BROADCAST from {sender}", "cyan"))
+        print(logger._color(f"      Recipients: {count}", "dim"))
+        print(logger._color(f"      Content: {content_preview}", "dim"))
+
+    def print_summary(self):
+        """打印消息系统状态摘要"""
+        inbox_files = list(self.dir.glob("*.jsonl"))
+        print(logger._color(f"\n  📊 Message System Summary:", "cyan"))
+        print(logger._color(f"      Inbox directory: {self.dir}", "dim"))
+        print(logger._color(f"      Active inboxes: {len(inbox_files)}", "dim"))
 
 
 BUS = MessageBus(INBOX_DIR)
@@ -137,6 +193,7 @@ class TeammateManager:
         self.config_path = self.dir / "config.json"
         self.config = self._load_config()
         self.threads = {}
+        self._teammate_iterations = {}  # 记录每个队友的迭代次数
 
     def _load_config(self) -> dict:
         if self.config_path.exists():
@@ -163,6 +220,11 @@ class TeammateManager:
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
         self._save_config()
+
+        # 日志：队友启动
+        self._print_teammate_spawned(name, role, prompt)
+
+        self._teammate_iterations[name] = 0
         thread = threading.Thread(
             target=self._teammate_loop,
             args=(name, role, prompt),
@@ -181,12 +243,20 @@ class TeammateManager:
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
         should_exit = False
-        for _ in range(50):
+
+        for iteration in range(50):
+            self._teammate_iterations[name] = iteration + 1
+
+            # 日志：队友迭代开始
+            self._print_teammate_iteration(name, iteration + 1)
+
             inbox = BUS.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
+
             if should_exit:
                 break
+
             try:
                 response = client.messages.create(
                     model=MODEL,
@@ -195,16 +265,22 @@ class TeammateManager:
                     tools=tools,
                     max_tokens=8000,
                 )
-            except Exception:
+            except Exception as e:
+                self._print_teammate_error(name, str(e))
                 break
+
             messages.append({"role": "assistant", "content": response.content})
+
             if response.stop_reason != "tool_use":
+                self._print_teammate_done(name, response.stop_reason)
                 break
+
+            # 执行工具调用
             results = []
             for block in response.content:
                 if block.type == "tool_use":
                     output = self._exec(name, block.name, block.input)
-                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                    self._print_teammate_tool(name, block.name, str(output))
                     results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -212,11 +288,15 @@ class TeammateManager:
                     })
                     if block.name == "shutdown_response" and block.input.get("approve"):
                         should_exit = True
+                        self._print_shutdown_approved(name)
+
             messages.append({"role": "user", "content": results})
+
         member = self._find_member(name)
         if member:
             member["status"] = "shutdown" if should_exit else "idle"
             self._save_config()
+            self._print_teammate_status_change(name, member["status"])
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         # these base tools are unchanged from s02
@@ -277,6 +357,7 @@ class TeammateManager:
         ]
 
     def list_all(self) -> str:
+        self._print_team_list()
         if not self.config["members"]:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
@@ -286,6 +367,84 @@ class TeammateManager:
 
     def member_names(self) -> list:
         return [m["name"] for m in self.config["members"]]
+
+    # -- 日志输出方法 --
+    def _print_teammate_spawned(self, name: str, role: str, prompt: str):
+        """打印队友启动日志"""
+        print(logger._color(f"\n{'┌' + '─' * 78 + '┐'}", "green"))
+        print(logger._color(f"│  🤖 TEAMMATE SPAWNED" + " " * 56 + "│", "green"))
+        print(logger._color(f"│  Name: {name}" + " " * (71 - len(name)) + "│", "green"))
+        print(logger._color(f"│  Role: {role}" + " " * (71 - len(role)) + "│", "dim"))
+        prompt_preview = prompt[:60] + "..." if len(prompt) > 60 else prompt
+        print(logger._color(f"│  Prompt: {prompt_preview}" + " " * (69 - len(prompt_preview)) + "│", "dim"))
+        print(logger._color(f"│  Protocols: 🔌 shutdown_request, 📋 plan_approval" + " " * 27 + "│", "yellow"))
+        print(logger._color(f"└" + "─" * 78 + "┘", "green"))
+
+    def _print_teammate_iteration(self, name: str, iteration: int):
+        """打印队友迭代日志"""
+        indent = "  "
+        print(logger._color(f"\n{indent}🔄 TEAMMATE [{name}] ITERATION #{iteration}", "magenta"))
+
+    def _print_teammate_tool(self, name: str, tool_name: str, output: str):
+        """打印队友工具调用日志"""
+        indent = "  "
+        output_preview = output[:80] + "..." if len(output) > 80 else output
+        print(logger._color(f"{indent}  ⚡ [{name}] {tool_name}: {output_preview}", "dim"))
+
+    def _print_teammate_done(self, name: str, stop_reason: str):
+        """打印队友完成日志"""
+        print(logger._color(f"\n  🏁 TEAMMATE [{name}] DONE: {stop_reason}", "green"))
+
+    def _print_teammate_error(self, name: str, error: str):
+        """打印队友错误日志"""
+        print(logger._color(f"\n  ❌ TEAMMATE [{name}] ERROR: {error}", "red"))
+
+    def _print_shutdown_approved(self, name: str):
+        """打印队友批准关闭日志"""
+        print(logger._color(f"\n  🔌 TEAMMATE [{name}] SHUTDOWN APPROVED - exiting...", "yellow"))
+
+    def _print_teammate_status_change(self, name: str, status: str):
+        """打印队友状态变化日志"""
+        status_icons = {"shutdown": "🛑", "idle": "💤", "working": "🔄"}
+        icon = status_icons.get(status, "❓")
+        iterations = self._teammate_iterations.get(name, 0)
+        print(logger._color(f"\n{'┌' + '─' * 78 + '┐'}", "cyan" if status == "idle" else "red"))
+        print(logger._color(f"│  {icon} TEAMMATE [{name}] STATUS: {status.upper()}" + " " * (45 - len(name) - len(status)) + "│",
+                           "cyan" if status == "idle" else "red"))
+        print(logger._color(f"│  Total iterations: {iterations}" + " " * (57 - len(str(iterations))) + "│", "dim"))
+        print(logger._color(f"└" + "─" * 78 + "┘", "cyan" if status == "idle" else "red"))
+
+    def _print_team_list(self):
+        """打印团队列表"""
+        if not self.config["members"]:
+            print(logger._color(f"\n  📋 No teammates found.", "dim"))
+            return
+
+        working = sum(1 for m in self.config["members"] if m["status"] == "working")
+        idle = sum(1 for m in self.config["members"] if m["status"] == "idle")
+        shutdown = sum(1 for m in self.config["members"] if m["status"] == "shutdown")
+        total = len(self.config["members"])
+
+        print(logger._color(f"\n{'╔' + '═' * 78 + '╗'}", "cyan"))
+        print(logger._color(f"║  👥 TEAM: {self.config['team_name']}" + " " * (66 - len(self.config['team_name'])) + "║", "cyan"))
+        print(logger._color(f"║  Total: {total} | 🔄 Working: {working} | 💤 Idle: {idle} | 🛑 Shutdown: {shutdown}" + " " * (78 - 65 - len(str([total, working, idle, shutdown]))) + "║", "dim"))
+        print(logger._color(f"╠" + "═" * 78 + "╣", "cyan"))
+
+        status_icons = {"working": "🔄", "idle": "💤", "shutdown": "🛑"}
+        for m in self.config["members"]:
+            icon = status_icons.get(m["status"], "❓")
+            line = f"  {icon} {m['name']} ({m['role']}): {m['status']}"
+            print(logger._color(f"║{line}" + " " * (78 - len(line) - 1) + "║", "dim"))
+
+        print(logger._color(f"╚" + "═" * 78 + "╝", "cyan"))
+
+    def print_summary(self):
+        """打印团队系统状态摘要"""
+        print(logger._color(f"\n  📊 Team System Summary:", "cyan"))
+        print(logger._color(f"      Team directory: {self.dir}", "dim"))
+        print(logger._color(f"      Team name: {self.config['team_name']}", "dim"))
+        print(logger._color(f"      Members: {len(self.config['members'])}", "dim"))
+        print(logger._color(f"      Active threads: {len([t for t in self.threads.values() if t.is_alive()])}", "dim"))
 
 
 TEAM = TeammateManager(TEAM_DIR)
@@ -351,6 +510,10 @@ def handle_shutdown_request(teammate: str) -> str:
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+
+    # 日志：关闭请求发起
+    _print_shutdown_request_initiated(req_id, teammate)
+
     BUS.send(
         "lead", teammate, "Please shut down gracefully.",
         "shutdown_request", {"request_id": req_id},
@@ -365,6 +528,10 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
         return f"Error: Unknown plan request_id '{request_id}'"
     with _tracker_lock:
         req["status"] = "approved" if approve else "rejected"
+
+    # 日志：计划审批
+    _print_plan_review(request_id, req["from"], approve, feedback)
+
     BUS.send(
         "lead", req["from"], feedback, "plan_approval_response",
         {"request_id": request_id, "approve": approve, "feedback": feedback},
@@ -374,7 +541,64 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
 
 def _check_shutdown_status(request_id: str) -> str:
     with _tracker_lock:
-        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
+        result = shutdown_requests.get(request_id, {"error": "not found"})
+
+    # 日志：关闭状态查询
+    if "error" not in result:
+        _print_shutdown_status_check(request_id, result)
+
+    return json.dumps(result)
+
+
+# -- 协议日志输出方法 --
+def _print_shutdown_request_initiated(req_id: str, teammate: str):
+    """打印关闭请求发起日志"""
+    print(logger._color(f"\n{'┌' + '─' * 78 + '┐'}", "yellow"))
+    print(logger._color(f"│  🔌 SHUTDOWN REQUEST INITIATED" + " " * 46 + "│", "yellow"))
+    print(logger._color(f"│  Request ID: {req_id}" + " " * (64 - len(req_id)) + "│", "yellow"))
+    print(logger._color(f"│  Target: {teammate}" + " " * (69 - len(teammate)) + "│", "dim"))
+    print(logger._color(f"│  Status: ⏳ Pending (waiting for response)" + " " * 35 + "│", "dim"))
+    print(logger._color(f"└" + "─" * 78 + "┘", "yellow"))
+
+
+def _print_shutdown_status_check(req_id: str, result: dict):
+    """打印关闭状态查询日志"""
+    status = result.get("status", "unknown")
+    target = result.get("target", "unknown")
+    status_icons = {"pending": "⏳", "approved": "✅", "rejected": "❌"}
+    icon = status_icons.get(status, "❓")
+    print(logger._color(f"  🔍 SHUTDOWN STATUS CHECK:", "cyan"))
+    print(logger._color(f"      Request ID: {req_id}", "dim"))
+    print(logger._color(f"      Target: {target}", "dim"))
+    print(logger._color(f"      Status: {icon} {status}", "dim"))
+
+
+def _print_plan_review(request_id: str, from_teammate: str, approve: bool, feedback: str):
+    """打印计划审批日志"""
+    status = "APPROVED" if approve else "REJECTED"
+    icon = "✅" if approve else "❌"
+    color = "green" if approve else "red"
+    print(logger._color(f"\n{'┌' + '─' * 78 + '┐'}", color))
+    print(logger._color(f"│  {icon} PLAN {status}" + " " * (64 - len(status)) + "│", color))
+    print(logger._color(f"│  Request ID: {request_id}" + " " * (64 - len(request_id)) + "│", color))
+    print(logger._color(f"│  From: {from_teammate}" + " " * (71 - len(from_teammate)) + "│", "dim"))
+    if feedback:
+        feedback_preview = feedback[:60] + "..." if len(feedback) > 60 else feedback
+        print(logger._color(f"│  Feedback: {feedback_preview}" + " " * (67 - len(feedback_preview)) + "│", "dim"))
+    print(logger._color(f"└" + "─" * 78 + "┘", color))
+
+
+def _print_protocol_summary():
+    """打印协议系统状态摘要"""
+    with _tracker_lock:
+        pending_shutdowns = sum(1 for r in shutdown_requests.values() if r["status"] == "pending")
+        approved_shutdowns = sum(1 for r in shutdown_requests.values() if r["status"] == "approved")
+        pending_plans = sum(1 for r in plan_requests.values() if r["status"] == "pending")
+        approved_plans = sum(1 for r in plan_requests.values() if r["status"] == "approved")
+
+    print(logger._color(f"\n  📊 Protocol System Summary:", "cyan"))
+    print(logger._color(f"      Shutdown requests: {len(shutdown_requests)} (⏳ {pending_shutdowns} pending, ✅ {approved_shutdowns} approved)", "dim"))
+    print(logger._color(f"      Plan requests: {len(plan_requests)} (⏳ {pending_plans} pending, ✅ {approved_plans} approved)", "dim"))
 
 
 # -- Lead tool dispatch (12 tools) --
@@ -423,7 +647,14 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """Lead Agent 循环"""
+    iteration = 0
+
     while True:
+        iteration += 1
+        logger.loop_iteration(iteration)
+
+        # 读取 lead 的收件箱
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({
@@ -434,6 +665,18 @@ def agent_loop(messages: list):
                 "role": "assistant",
                 "content": "Noted inbox messages.",
             })
+
+        logger.messages_snapshot(messages, "BEFORE LLM CALL")
+
+        # 显示原始请求
+        logger.request_raw(
+            model=MODEL,
+            system=SYSTEM,
+            messages=messages,
+            tools=TOOLS,
+            max_tokens=8000
+        )
+
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -441,27 +684,60 @@ def agent_loop(messages: list):
             tools=TOOLS,
             max_tokens=8000,
         )
+
+        # 显示原始响应
+        logger.response_raw(response)
+
+        # 显示响应摘要
+        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        logger.llm_response_summary(response.stop_reason, usage, len(response.content))
+        logger.response_content_blocks(response.content)
+
         messages.append({"role": "assistant", "content": response.content})
+        logger.messages_snapshot(messages, "AFTER APPEND ASSISTANT")
+
         if response.stop_reason != "tool_use":
+            logger.loop_end(f"stop_reason = '{response.stop_reason}'")
             return
+
+        # 执行工具调用
+        logger.section("Executing Tool Calls", "🔧")
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                input_data = dict(block.input)
+                logger.tool_call(block.name, input_data, block.id)
+
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
+
+                is_error = str(output).startswith("Error:")
+                logger.tool_result(block.id, str(output), is_error=is_error)
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": str(output),
                 })
+
         messages.append({"role": "user", "content": results})
+        logger.messages_snapshot(messages, "AFTER APPEND TOOL RESULTS")
+        logger.separator(f"END OF ITERATION {iteration}")
 
 
 if __name__ == "__main__":
+    logger.header("s10 Team Protocols - Interactive Mode", "s10")
+
+    # 显示系统状态
+    TEAM.print_summary()
+    BUS.print_summary()
+    _print_protocol_summary()
+
+    print(logger._color(f"\n  💡 Commands: /team (list teammates), /inbox (check messages)", "dim"))
+    print(logger._color(f"  🔌 Protocols: shutdown_request, plan_approval", "dim"))
+
     history = []
     while True:
         try:
@@ -474,8 +750,16 @@ if __name__ == "__main__":
             print(TEAM.list_all())
             continue
         if query.strip() == "/inbox":
-            print(json.dumps(BUS.read_inbox("lead"), indent=2))
+            inbox = BUS.read_inbox("lead")
+            print(json.dumps(inbox, indent=2))
             continue
+
+        logger.user_input(query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        logger.separator("FINAL RESPONSE")
+        for block in history[-1]["content"] if isinstance(history[-1]["content"], list) else []:
+            if hasattr(block, "text"):
+                print(block.text)
         print()
